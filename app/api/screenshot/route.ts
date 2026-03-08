@@ -3,6 +3,9 @@ import { chromium } from 'playwright-extra';
 import { Browser } from 'playwright';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { z } from 'zod';
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
 
 chromium.use(stealthPlugin());
 
@@ -32,7 +35,7 @@ const screenshotSchema = z.object({
   height: z.coerce.number().int().min(100).max(4000).default(800),
   full_page: boolParam(false),
 
-  format: z.enum(['png', 'jpeg']).default('png'),
+  format: z.enum(['png', 'jpeg', 'webm']).default('png'),
   quality: z.coerce.number().int().min(1).max(100).default(80),
   omit_background: boolParam(false),
   device_scale_factor: z.coerce.number().int().min(1).max(3).default(2),
@@ -41,12 +44,18 @@ const screenshotSchema = z.object({
   wait_for_timeout: z.coerce.number().int().min(0).max(30000).optional(),
   wait_for_selector: z.string().optional(),
 
+  scroll_to_element: z.string().optional(),
+  scroll_by: z.coerce.number().int().optional(),
+  scroll_delay: z.coerce.number().int().min(0).max(10000).default(500),
+  scroll_max_time: z.coerce.number().int().min(0).max(60000).default(15000),
+  scroll_max_distance: z.coerce.number().int().min(0).optional(),
+
   dark_mode: boolParam(false),
   hide_selectors: z.string().optional(),
   user_agent: z.string().optional(),
 
   block_ads_trackers: boolParam(true),
-  block_cookie_banners: boolParam(false),
+  block_cookie_banners: boolParam(true),
 
   cold_boot: boolParam(false),
 });
@@ -90,6 +99,13 @@ export async function GET(req: NextRequest) {
       deviceScaleFactor: options.device_scale_factor,
       colorScheme: options.dark_mode ? 'dark' : 'light',
     };
+
+    if (options.format === 'webm') {
+      contextOptions.recordVideo = {
+        dir: path.join(os.tmpdir(), 'prexel-videos'),
+        size: { width: options.width, height: options.height }
+      };
+    }
 
     if (options.user_agent) {
       contextOptions.userAgent = options.user_agent;
@@ -142,6 +158,47 @@ export async function GET(req: NextRequest) {
       await page.waitForTimeout(options.wait_for_timeout);
     } else if (options.wait_until === 'load' && !options.wait_for_selector) {
       await page.waitForTimeout(500);
+    }
+
+    // Scrolling Logic
+    if (options.scroll_by || options.full_page || options.scroll_to_element) {
+      if (options.scroll_to_element) {
+        await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          if (el) el.scrollIntoView({ behavior: 'smooth' });
+        }, options.scroll_to_element).catch(() => { });
+        await page.waitForTimeout(options.scroll_delay);
+      } else {
+        console.log(`[Screenshot API] Auto-scrolling page...`);
+        await page.evaluate(async ({ scroll_by, scroll_delay, scroll_max_time, scroll_max_distance }) => {
+          await new Promise<void>((resolve) => {
+            let totalHeight = 0;
+            const distance = scroll_by || 500;
+            const timer = setInterval(() => {
+              const scrollHeight = document.documentElement.scrollHeight;
+              window.scrollBy({ top: distance, left: 0, behavior: 'smooth' });
+              totalHeight += distance;
+
+              const hitMaxDistance = scroll_max_distance && totalHeight >= scroll_max_distance;
+              const hitBottom = totalHeight >= scrollHeight - window.innerHeight;
+
+              if (hitBottom || hitMaxDistance) {
+                clearInterval(timer);
+                resolve();
+              }
+            }, scroll_delay);
+
+            setTimeout(() => { clearInterval(timer); resolve(); }, scroll_max_time);
+          });
+        }, {
+          scroll_by: options.scroll_by,
+          scroll_delay: options.scroll_delay,
+          scroll_max_time: options.scroll_max_time,
+          scroll_max_distance: options.scroll_max_distance
+        });
+        // Wait a bit after scrolling for final images to load
+        await page.waitForTimeout(500);
+      }
     }
 
     // Run Cookie Blockers AFTER all waiting strategies have finished and the DOM is settled
@@ -197,32 +254,45 @@ export async function GET(req: NextRequest) {
       await page.waitForTimeout(1000); // Give the banner 1 second to play its exit animation
     }
 
-    const screenshotOptions: any = {
-      fullPage: options.full_page, // This is safely a boolean now!
-      type: options.format,
-    };
+    let resultBuffer: Buffer;
+    let contentType = 'image/png';
 
-    if (options.format === 'jpeg') {
-      screenshotOptions.quality = options.quality;
+    if (options.format === 'webm') {
+      const video = await page.video();
+      if (!video) throw new Error('Video recording failed');
+
+      const videoPath = await video.path();
+      await context.close(); // wait for context to finish writing
+
+      resultBuffer = await fs.readFile(videoPath);
+      await fs.unlink(videoPath).catch(() => { }); // clean up
+      contentType = 'video/webm';
+    } else {
+      const screenshotOptions: any = {
+        fullPage: options.full_page,
+        type: options.format,
+      };
+
+      if (options.format === 'jpeg') {
+        screenshotOptions.quality = options.quality;
+      }
+
+      if (options.omit_background && options.format === 'png') {
+        screenshotOptions.omitBackground = true;
+      }
+
+      resultBuffer = await page.screenshot(screenshotOptions);
+      await context.close();
+      contentType = options.format === 'jpeg' ? 'image/jpeg' : 'image/png';
     }
-
-    if (options.omit_background && options.format === 'png') {
-      screenshotOptions.omitBackground = true;
-    }
-
-    const screenshotBuffer = await page.screenshot(screenshotOptions);
-
-    await context.close();
 
     if (options.cold_boot && browser) {
-      await browser.close();
+      await browser.close().catch(() => { });
     }
 
     console.log(`[Screenshot API] Successfully rendered ${options.url} in ${Date.now() - startTime}ms`);
 
-    const contentType = options.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-
-    return new NextResponse(screenshotBuffer as any, {
+    return new NextResponse(resultBuffer as any, {
       status: 200,
       headers: {
         'Content-Type': contentType,
